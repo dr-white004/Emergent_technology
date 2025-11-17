@@ -1,0 +1,22 @@
+# FastAPI and Server
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+
+# Database
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+argon2-cffi==23.1.0
+python-dotenv==1.0.1
+
+# Validation
+pydantic==2.10.3
+pydantic-settings==2.6.1
+email-validator==2.2.0
+
+# Utilities
+python-dateutil==2.9.0.post0
