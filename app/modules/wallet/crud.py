@@ -91,12 +91,13 @@ def create_transaction_record(
     return transaction
 
 
+
 def fund_wallet(db: Session, user_id: UUID, amount: Decimal) -> Tuple[Transaction, Decimal]:
     """
-    Fund user wallet (simulated deposit)
+    Fund user wallet with proper row locking to prevent race conditions
     Returns: (transaction, new_balance)
     """
-    # CRITICAL: Validation as per requirements
+    # Validation
     if amount < Decimal("100"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -109,11 +110,21 @@ def fund_wallet(db: Session, user_id: UUID, amount: Decimal) -> Tuple[Transactio
         )
     
     try:
-        wallet = get_user_wallet(db, user_id)
+        # CRITICAL FIX: Lock wallet row to prevent race conditions
+        wallet = db.query(Wallet).filter(
+            Wallet.user_id == user_id
+        ).with_for_update().first()
         
-        # Update balance
+        if not wallet:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Wallet not found"
+            )
+        
+        # Update balance (now safe from concurrent modifications)
         wallet.balance += amount
         
+        # Create transaction record
         transaction = create_transaction_record(
             db=db,
             transaction_type=TransactionType.DEPOSIT,
@@ -128,22 +139,25 @@ def fund_wallet(db: Session, user_id: UUID, amount: Decimal) -> Tuple[Transactio
         
         return transaction, wallet.balance
     
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
+        # Create failed transaction record
         failed_txn = create_transaction_record(
             db=db,
             transaction_type=TransactionType.DEPOSIT,
             amount=amount,
-            recipient_id=None,  
             description="Wallet funding failed",
             status=TransactionStatus.FAILED
         )
         db.commit()
-        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Funding failed: {str(e)}"
         )
+
 
 
 def transfer_funds(
@@ -312,10 +326,10 @@ def create_voucher(
     expiry_days: int = 90
 ) -> Tuple[Voucher, Decimal]:
     """
-    Create a voucher by debiting user's wallet
+    Create a voucher by debiting user's wallet with proper row locking
     Returns: (voucher, new_balance)
     """
-    # CRITICAL: Validation as per requirements
+    # Validation
     if amount < Decimal("100"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -328,21 +342,30 @@ def create_voucher(
         )
     
     try:
-        wallet = get_user_wallet(db, user_id)
+        # CRITICAL FIX: Lock wallet row to prevent race conditions
+        wallet = db.query(Wallet).filter(
+            Wallet.user_id == user_id
+        ).with_for_update().first()
         
-        # CRITICAL: Check sufficient balance
+        if not wallet:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Wallet not found"
+            )
+        
+        # Check sufficient balance (now safe from concurrent modifications)
         if wallet.balance < amount:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Insufficient balance"
             )
         
-        # CRITICAL: Generate unique voucher code
+        # Generate unique voucher code
         code = generate_voucher_code()
         while db.query(Voucher).filter(Voucher.code == code).first():
             code = generate_voucher_code()
         
-        # Debit wallet
+        # Debit wallet (atomic operation)
         wallet.balance -= amount
         
         # Create voucher
@@ -354,7 +377,7 @@ def create_voucher(
         )
         db.add(voucher)
         
-        # CRITICAL: Create transaction record
+        # Create transaction record
         create_transaction_record(
             db=db,
             transaction_type=TransactionType.VOUCHER_CREATE,
@@ -380,15 +403,25 @@ def create_voucher(
         )
 
 
+
 def redeem_voucher(db: Session, user_id: UUID, code: str) -> Tuple[Decimal, Decimal]:
     """
-    Redeem a voucher and credit user's wallet
+    Redeem a voucher and credit user's wallet with proper row locking
     Returns: (voucher_amount, new_balance)
     """
     try:
-        wallet = get_user_wallet(db, user_id)
+        # Lock BOTH wallet and voucher rows
+        wallet = db.query(Wallet).filter(
+            Wallet.user_id == user_id
+        ).with_for_update().first()
         
-        # CRITICAL: Get voucher with lock to prevent double redemption
+        if not wallet:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Wallet not found"
+            )
+        
+        # Lock voucher to prevent double redemption
         voucher = db.query(Voucher).filter(
             Voucher.code == code
         ).with_for_update().first()
@@ -399,7 +432,7 @@ def redeem_voucher(db: Session, user_id: UUID, code: str) -> Tuple[Decimal, Deci
                 detail="Voucher not found"
             )
         
-        # CRITICAL: Validations as per requirements
+        # Validations
         if voucher.is_redeemed:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -418,6 +451,7 @@ def redeem_voucher(db: Session, user_id: UUID, code: str) -> Tuple[Decimal, Deci
                 detail="Cannot redeem your own voucher"
             )
         
+        # Credit wallet (atomic operation)
         wallet.balance += voucher.amount
         
         # Mark voucher as redeemed
@@ -425,7 +459,7 @@ def redeem_voucher(db: Session, user_id: UUID, code: str) -> Tuple[Decimal, Deci
         voucher.redeemer_id = wallet.id
         voucher.redeemed_at = datetime.now()
         
-        # CRITICAL: Create transaction record
+        # Create transaction record
         create_transaction_record(
             db=db,
             transaction_type=TransactionType.VOUCHER_REDEEM,
